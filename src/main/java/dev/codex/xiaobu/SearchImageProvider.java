@@ -47,14 +47,10 @@ public final class SearchImageProvider extends ContentProvider {
         requireWriter();
         if (!CONTENT.equals(uri)) throw new IllegalArgumentException("Invalid search collection");
         try {
+            // The module owns this write. Engines receive a read grant through the
+            // launch Intent, which also makes this provider visible to them.
             File file = cache.create();
-            Uri result = CONTENT.buildUpon().appendPath(file.getName()).build();
-            // Xiaobu forwards this read grant to the chosen app via ClipData.
-            long identity = Binder.clearCallingIdentity();
-            try { getContext().grantUriPermission("com.coloros.colordirectservice", result, Intent.FLAG_GRANT_READ_URI_PERMISSION); }
-            catch (RuntimeException error) { file.delete(); throw error; }
-            finally { Binder.restoreCallingIdentity(identity); }
-            return result;
+            return CONTENT.buildUpon().appendPath(file.getName()).build();
         } catch (IOException error) { throw new IllegalStateException("Cannot prepare search image", error); }
     }
     @Override public ParcelFileDescriptor openFile(Uri uri, String mode) throws FileNotFoundException {
@@ -66,7 +62,7 @@ public final class SearchImageProvider extends ContentProvider {
         if (!"w".equals(mode) && !"wt".equals(mode)) throw new FileNotFoundException("Unsupported image mode");
         return ParcelFileDescriptor.open(file(uri), ParcelFileDescriptor.MODE_WRITE_ONLY | ParcelFileDescriptor.MODE_TRUNCATE);
     }
-    @Override public String getType(Uri uri) { return "image/png"; }
+    @Override public String getType(Uri uri) { return "image/jpeg"; }
     @Override public Cursor query(Uri uri, String[] projection, String selection, String[] args, String order) {
         requireReader(uri);
         try {

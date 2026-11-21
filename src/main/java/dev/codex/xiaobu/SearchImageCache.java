@@ -11,10 +11,10 @@ final class SearchImageCache {
     synchronized File create() throws IOException {
         if (!directory.isDirectory() && !directory.mkdirs()) throw new IOException("Search cache unavailable");
         prune();
-        return File.createTempFile("search-", ".png", directory);
+        return File.createTempFile("search-", ".jpg", directory);
     }
     File resolve(String name) throws IOException {
-        if (name == null || !name.matches("search-[A-Za-z0-9_-]+\\.png")) throw new FileNotFoundException("Invalid search image");
+        if (name == null || !name.matches("search-[A-Za-z0-9_-]+\\.jpe?g")) throw new FileNotFoundException("Invalid search image");
         File file = new File(directory, name);
         if (!file.getCanonicalFile().getParentFile().equals(directory.getCanonicalFile()) || !file.isFile())
             throw new FileNotFoundException("Search image expired");
@@ -25,6 +25,6 @@ final class SearchImageCache {
         if (files == null) return;
         long cutoff = System.currentTimeMillis() - 86400000L;
         for (File file : files)
-            if (file.getName().matches("search-[A-Za-z0-9_-]+\\.png") && file.lastModified() < cutoff) file.delete();
+            if (file.getName().matches("search-[A-Za-z0-9_-]+\\.jpe?g") && file.lastModified() < cutoff) file.delete();
     }
 }

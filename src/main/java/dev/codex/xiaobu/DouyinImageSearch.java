@@ -2,7 +2,7 @@ package dev.codex.xiaobu;
 
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
-import android.net.Uri;
+import android.graphics.Bitmap;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
@@ -11,24 +11,21 @@ import java.util.concurrent.TimeUnit;
 
 /** Copies only the selected screenshot, then starts the native photo-question result. */
 final class DouyinImageSearch {
-    static void open(Context context, Uri image) throws Exception {
+    static void open(Context context, Bitmap image) throws Exception {
         ApplicationInfo target = context.getPackageManager().getApplicationInfo("com.ss.android.ugc.aweme", 0);
         // The internal parcel model is versioned. Fail explicitly after an app upgrade.
         String version = context.getPackageManager().getPackageInfo(target.packageName, 0).versionName;
-        if (!"40.8.0".equals(version)) throw new java.io.IOException("Unsupported Douyin version");
+        if (!"40.8.0".equals(version) && !"40.5.0".equals(version))
+            throw new java.io.IOException("Unsupported Douyin version " + version);
         File stage = File.createTempFile("douyin-search-", ".png", context.getCacheDir());
         try {
-            try (InputStream in = context.getContentResolver().openInputStream(image);
-                    FileOutputStream out = new FileOutputStream(stage)) {
-                if (in == null) throw new java.io.IOException("Screenshot unavailable");
-                byte[] buffer = new byte[16384]; int n, total = 0;
-                while ((n = in.read(buffer)) != -1) {
-                    total += n;
-                    if (total > 32 * 1024 * 1024) throw new java.io.IOException("Screenshot too large");
-                    out.write(buffer, 0, n);
-                }
-                if (total == 0) throw new java.io.IOException("Empty screenshot");
+            try (FileOutputStream out = new FileOutputStream(stage)) {
+                if (image == null || image.isRecycled()
+                        || !image.compress(Bitmap.CompressFormat.PNG, 100, out))
+                    throw new java.io.IOException("Screenshot unavailable");
             }
+            if (stage.length() == 0) throw new java.io.IOException("Empty screenshot");
+            if (stage.length() > 32 * 1024 * 1024) throw new java.io.IOException("Screenshot too large");
             // Each result page retains its original while the user crops or revisits it.
             String destination = target.dataDir + "/cache/xiaobu-photo-question-" + stage.getName();
             String script = "set -e\ncp " + quote(stage.getAbsolutePath()) + " " + quote(destination)
@@ -36,7 +33,7 @@ final class DouyinImageSearch {
                     + "\nchmod 600 " + quote(destination) + "\nrestorecon " + quote(destination)
                     + "\nCLASSPATH=" + quote(context.getApplicationInfo().sourceDir)
                     + " app_process /system/bin dev.codex.xiaobu.DouyinRootBridge "
-                    + quote(target.sourceDir) + " " + quote(destination) + "\n";
+                    + quote(target.sourceDir) + " " + quote(destination) + " " + quote(version) + "\n";
             Process process = new ProcessBuilder("su", "-c", script).redirectErrorStream(true).start();
             try {
                 if (!process.waitFor(20, TimeUnit.SECONDS)) throw new java.io.IOException("Root handoff timed out");

@@ -11,13 +11,23 @@ import java.lang.reflect.Method;
 public final class DouyinRootBridge {
     public static void main(String[] args) throws Exception {
         try {
-            if (android.os.Process.myUid() != 0 || args.length != 2) throw new SecurityException("Root required");
+            if (android.os.Process.myUid() != 0 || args.length != 3) throw new SecurityException("Root required");
             ClassLoader loader = new PathClassLoader(args[0], ClassLoader.getSystemClassLoader());
-            Class<?> model = loader.loadClass("X.0jkf"), picture = loader.loadClass("X.0jzS");
+            // The visual-search parcel model is obfuscated per release. The whole
+            // parameter shape is shared: only the class and setter names move.
+            String modelName, pictureName, setterName;
+            if ("40.8.0".equals(args[2])) {
+                modelName = "X.0jkf"; pictureName = "X.0jzS"; setterName = "LLFFF";
+            } else if ("40.5.0".equals(args[2])) {
+                modelName = "X.0esI"; pictureName = "X.1IJG"; setterName = "LL";
+            } else {
+                throw new SecurityException("Unsupported Douyin version " + args[2]);
+            }
+            Class<?> model = loader.loadClass(modelName), picture = loader.loadClass(pictureName);
             Object params = model.getConstructor().newInstance();
             Object scan = picture.getConstructor(String.class, long.class, String.class,
                     java.util.List.class, Integer.class).newInstance(null, System.currentTimeMillis(), args[1], null, null);
-            model.getMethod("LLFFF", picture).invoke(params, scan);
+            model.getMethod(setterName, picture).invoke(params, scan);
             for (String[] value : new String[][]{{"m", "result"}, {"a", "scan"}, {"d", "scan"},
                     {"f", "choose_album"}, {"g", "scan_album"}, {"F", "question"}, {"I", "question"}}) {
                 Field field = model.getDeclaredField(value[0]); field.setAccessible(true); field.set(params, value[1]);

@@ -33,7 +33,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import de.robv.android.xposed.XposedBridge;
 
-/** Native menu, bounded image writes and package-restricted engine handoff. */
+/** Native menu, gallery save and in-process image search handoff. */
 final class ScreenshotActions {
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final int[] MENU_ENGINES = {0, 1, 2, 3, 4, 6};
@@ -42,6 +42,16 @@ final class ScreenshotActions {
     private static final String[] ENTRY_POINTS = {
             "com.google.android.apps.search.lens.LensShareEntryPointActivity",
             "com.yandex.browser.ShareImageActivity" };
+    static final String MODULE_PACKAGE = "dev.codex.xiaobu.launcherhook";
+    static final String SEARCH_ACTIVITY = "dev.codex.xiaobu.WebSearchActivity";
+    static final String EXTRA_ENGINE = "engine";
+    // Defaults to the old web upload for hosts that do not send this extra.
+    static final String EXTRA_WEB = "web";
+    // A bounded JPEG keeps the Intent under the Binder transaction limit; Android
+    // forbids file descriptors in Intent extras, so bitmaps cannot be parceled.
+    static final String EXTRA_IMAGE = "image";
+    private static final int SEARCH_EDGE = 1600;
+    private static final int SEARCH_BYTES = 512 * 1024;
     private static final ThreadPoolExecutor WRITER = new ThreadPoolExecutor(1, 1, 30,
             TimeUnit.SECONDS, new ArrayBlockingQueue<Runnable>(1), runnable -> {
                 Thread thread = new Thread(runnable, "XiaobuSaveScreenshot");
@@ -65,7 +75,7 @@ final class ScreenshotActions {
     static void saveAndClose(View alert, ScreenshotButtons.Binding binding, ScreenshotButtons.NativeUi ui) {
         Context app = alert.getContext().getApplicationContext();
         ScreenshotSession.Action<Bitmap> action = claim(app, binding);
-        if (action != null && enqueue(app, action, null)) closeRecognition(alert, ui);
+        if (action != null && enqueue(app, action)) closeRecognition(alert, ui);
     }
 
     static void showMenu(View alert, View anchor, ScreenshotButtons.Binding binding,
@@ -122,24 +132,16 @@ final class ScreenshotActions {
                             }
                             // Selection is the first point where an image is borrowed or saved.
                             ScreenshotSession.Action<Bitmap> action = claim(app, binding);
-                            if (action != null) enqueue(app, action, uri -> {
-                                View current = target.get();
-                                if (current == null || binding.closed
-                                        || !binding.isCurrent()) return;
-                                if (web) {
-                                    closeRecognition(current, ui);
-                                    uploadAndOpen(app, engine, uri, binding.generation);
-                                    return;
-                                }
-                                Intent intent = resolveShare(app, engine, uri, null);
-                                if (intent == null) { toast(app, "未找到对应的识图应用"); return; }
-                                closeRecognition(current, ui);
-                                MAIN.postDelayed(() -> {
-                                    // A newer recognition must not be interrupted by an older save.
-                                    if (!binding.isHandoffCurrent()) return;
-                                    launch(app, engine, uri, intent);
-                                }, 320);
-                            });
+                            if (action == null) return ui.unit;
+                            View current = target.get();
+                            if (current == null || binding.closed || !binding.isCurrent()) {
+                                action.finish(false);
+                                return ui.unit;
+                            }
+                            // Android 11+ hides other packages from the host, so the host
+                            // cannot write into our provider. Hand the bitmap to the module
+                            // process, which owns the provider and grants the engines access.
+                            if (startSearch(app, action, engine, web)) closeRecognition(current, ui);
                             return ui.unit;
                         }
                         if ("hashCode".equals(method.getName())) return System.identityHashCode(proxy);
@@ -168,11 +170,77 @@ final class ScreenshotActions {
         return action;
     }
 
-    private interface SavedCallback { void onSaved(Uri uri); }
-
-    private static boolean enqueue(Context app, ScreenshotSession.Action<Bitmap> action, SavedCallback callback) {
+    /** Compresses off the main thread, then hands the bytes to the module process. */
+    private static boolean startSearch(Context app, ScreenshotSession.Action<Bitmap> action,
+            int engine, boolean web) {
         try {
-            WRITER.execute(() -> write(app, action, callback));
+            WRITER.execute(() -> {
+                boolean started = false;
+                try {
+                    byte[] picture = searchImage(action.value());
+                    Intent request = new Intent(Intent.ACTION_VIEW)
+                            .setClassName(MODULE_PACKAGE, SEARCH_ACTIVITY)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            .putExtra(EXTRA_ENGINE, engine)
+                            .putExtra(EXTRA_WEB, web)
+                            .putExtra(EXTRA_IMAGE, picture);
+                    app.startActivity(request);
+                    started = true;
+                    XposedBridge.log("XiaobuLauncherHook: image search handoff " + picture.length + " bytes");
+                } catch (Throwable error) {
+                    ScreenshotButtons.log("image search handoff failed", error);
+                    toast(app, "无法启动识图应用");
+                } finally {
+                    action.finish(started);
+                }
+            });
+            return true;
+        } catch (RejectedExecutionException full) {
+            action.finish(false);
+            toast(app, "正在保存截图，请稍后重试");
+            return false;
+        } catch (Throwable error) {
+            action.finish(false);
+            ScreenshotButtons.log("search handoff writer unavailable", error);
+            toast(app, "无法启动识图应用");
+            return false;
+        }
+    }
+
+    /** JPEG at the same resolution cap the web engines used to receive. */
+    private static byte[] searchImage(Bitmap source) throws Exception {
+        if (source == null || source.isRecycled()) throw new IllegalStateException("Screenshot no longer available");
+        if (source.getWidth() < 1 || source.getHeight() < 1
+                || source.getWidth() > 20000 || source.getHeight() > 20000)
+            throw new IllegalStateException("Invalid screenshot dimensions");
+        int sample = 1;
+        while (Math.max(source.getWidth(), source.getHeight()) / sample > SEARCH_EDGE) sample *= 2;
+        Bitmap picture = sample == 1 ? source : Bitmap.createScaledBitmap(source,
+                Math.max(1, source.getWidth() / sample), Math.max(1, source.getHeight() / sample), true);
+        try {
+            int quality = 92;
+            while (true) {
+                java.io.ByteArrayOutputStream output = new java.io.ByteArrayOutputStream();
+                if (!picture.compress(Bitmap.CompressFormat.JPEG, quality, output))
+                    throw new IllegalStateException("JPEG encoding failed");
+                byte[] data = output.toByteArray();
+                if (data.length <= SEARCH_BYTES) return data;
+                if (quality > 60) { quality -= 12; continue; }
+                int width = picture.getWidth() * 3 / 4, height = picture.getHeight() * 3 / 4;
+                if (width < 64 || height < 64) return data;
+                Bitmap smaller = Bitmap.createScaledBitmap(picture, width, height, true);
+                if (picture != source) picture.recycle();
+                picture = smaller;
+                quality = 85;
+            }
+        } finally {
+            if (picture != source && !picture.isRecycled()) picture.recycle();
+        }
+    }
+
+    private static boolean enqueue(Context app, ScreenshotSession.Action<Bitmap> action) {
+        try {
+            WRITER.execute(() -> write(app, action));
             return true;
         } catch (RejectedExecutionException full) {
             action.finish(false);
@@ -186,41 +254,35 @@ final class ScreenshotActions {
         }
     }
 
-    private static void write(Context app, ScreenshotSession.Action<Bitmap> action, SavedCallback callback) {
+    private static void write(Context app, ScreenshotSession.Action<Bitmap> action) {
         Uri uri = null;
         boolean success = false;
         try {
             Bitmap picture = action.value();
             if (picture.isRecycled()) throw new IllegalStateException("Screenshot no longer available");
-            boolean saveToGallery = callback == null;
             ContentValues values = new ContentValues();
-            if (saveToGallery) {
-                String date = new SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(new Date());
-                values.put(MediaStore.Images.Media.DISPLAY_NAME, "小布识屏_" + date + ".png");
-                values.put(MediaStore.Images.Media.MIME_TYPE, "image/png");
-                if (Build.VERSION.SDK_INT >= 29) {
-                    values.put("relative_path", "Pictures/小布识屏增强");
-                    values.put("is_pending", 1);
-                }
-                uri = app.getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
-                if (uri == null) throw new IllegalStateException("MediaStore insert returned null");
-            } else {
-                uri = app.getContentResolver().insert(SearchImageProvider.CONTENT, values);
-                if (uri == null) throw new IllegalStateException("Search cache insert returned null");
+            String date = new SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(new Date());
+            values.put(MediaStore.Images.Media.DISPLAY_NAME, "小布识屏_" + date + ".png");
+            values.put(MediaStore.Images.Media.MIME_TYPE, "image/png");
+            if (Build.VERSION.SDK_INT >= 29) {
+                values.put("relative_path", "Pictures/小布识屏增强");
+                values.put("is_pending", 1);
             }
+            uri = app.getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+            if (uri == null) throw new IllegalStateException("MediaStore insert returned null");
             try (OutputStream stream = app.getContentResolver().openOutputStream(uri)) {
                 if (stream == null || !picture.compress(Bitmap.CompressFormat.PNG, 100, stream)) {
                     throw new IllegalStateException("PNG write failed");
                 }
             }
-            if (saveToGallery && Build.VERSION.SDK_INT >= 29) {
+            if (Build.VERSION.SDK_INT >= 29) {
                 ContentValues ready = new ContentValues();
                 ready.put("is_pending", 0);
                 if (app.getContentResolver().update(uri, ready, null, null) != 1) {
                     throw new IllegalStateException("MediaStore image was not published");
                 }
             }
-            XposedBridge.log("XiaobuLauncherHook: " + (saveToGallery ? "screenshot saved to " : "search image cached at ") + uri);
+            XposedBridge.log("XiaobuLauncherHook: screenshot saved to " + uri);
             success = true;
         } catch (Throwable error) {
             if (uri != null) {
@@ -231,16 +293,6 @@ final class ScreenshotActions {
             toast(app, "保存截图失败");
         } finally {
             action.finish(success);
-        }
-        if (success && callback != null) {
-            final Uri saved = uri;
-            MAIN.post(() -> {
-                try { callback.onSaved(saved); }
-                catch (Throwable error) {
-                    ScreenshotButtons.log("image search handoff failed", error);
-                    toast(app, "无法打开识图应用");
-                }
-            });
         }
     }
 
@@ -255,16 +307,6 @@ final class ScreenshotActions {
         return intent;
     }
 
-    private static void uploadAndOpen(Context app, int engine, Uri picture, long generation) {
-        try {
-            Intent request = imageIntent(picture).setClassName("dev.codex.xiaobu.launcherhook", "dev.codex.xiaobu.WebSearchActivity");
-            request.putExtra("engine", engine);
-            request.setAction(Intent.ACTION_VIEW);
-            app.startActivity(request);
-        } catch (Exception error) {
-            toast(app, "无法启动网页识图，请确认已安装新版模块");
-        }
-    }
     private static boolean canOpen(Context context, ActivityInfo info, String requiredPackage) {
         return info != null && requiredPackage.equals(info.packageName) && info.exported && info.enabled
                 && (info.applicationInfo == null || info.applicationInfo.enabled)
@@ -272,7 +314,7 @@ final class ScreenshotActions {
                         info.permission, context.getPackageName()) == PackageManager.PERMISSION_GRANTED);
     }
 
-    private static Intent resolveShare(Context app, int engine, Uri uri, String excludedClass) {
+    static Intent resolveShare(Context app, int engine, Uri uri, String excludedClass) {
         try {
             if (engine == 2) {
                 Intent search = new Intent(Intent.ACTION_VIEW, Uri.parse("snssdk1128://search/visual").buildUpon()
@@ -303,7 +345,7 @@ final class ScreenshotActions {
         return null;
     }
 
-    private static void launch(Context app, int engine, Uri uri, Intent intent) {
+    static void launch(Context app, int engine, Uri uri, Intent intent) {
         try {
             app.startActivity(intent);
         } catch (Exception first) {
